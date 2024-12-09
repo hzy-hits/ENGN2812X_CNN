@@ -1,187 +1,147 @@
+Corrected CNN Implementation
+
 #include "hls_stream.h"
 #include "ap_int.h"
 #include "cnn.h"
+#include <algorithm>
+    using namespace std;
 
-// 定义数据流类型
 typedef struct
 {
     DTYPE data;
-    ap_uint<16> h;
-    ap_uint<16> w;
-    ap_uint<16> c;
+    ap_uint<7> h; // 0-115
+    ap_uint<7> w; // 0-115
+    ap_uint<6> c; // 0-63
 } DataFlow;
 
-// 读取输入数据到stream
-void read_input(DTYPE *input, hls::stream<DataFlow> &in_stream)
+// 特征图分块参数
+const int TILE_SIZE = 14;  // 输出特征图分块大小
+const int IC_PARALLEL = 4; // 输入通道并行度
+const int OC_PARALLEL = 4; // 输出通道并行度
+
+// 读取一个输入tile的完整数据到本地buffer
+void load_input_tile(
+    DTYPE *input,
+    DTYPE local_input[TILE_SIZE + kKernel - 1][TILE_SIZE + kKernel - 1][kNum],
+    int tile_h, int tile_w)
 {
 #pragma HLS INLINE off
-    for (int h = 0; h < kInImSize; ++h)
+
+    const int in_h_start = tile_h * TILE_SIZE;
+    const int in_w_start = tile_w * TILE_SIZE;
+    const int in_h_end = min(in_h_start + TILE_SIZE + kKernel - 1, kInImSize);
+    const int in_w_end = min(in_w_start + TILE_SIZE + kKernel - 1, kInImSize);
+
+    // 加载整个tile区域的数据
+    for (int h = in_h_start; h < in_h_end; ++h)
     {
-        for (int w = 0; w < kInImSize; ++w)
+        for (int w = in_w_start; w < in_w_end; ++w)
         {
-#pragma HLS PIPELINE II = 1
             for (int c = 0; c < kNum; ++c)
             {
-                DataFlow temp;
-                temp.data = input[(h * kInImSize + w) * kNum + c];
-                temp.h = h;
-                temp.w = w;
-                temp.c = c;
-                in_stream.write(temp);
+#pragma HLS PIPELINE II = 1
+                int local_h = h - in_h_start;
+                int local_w = w - in_w_start;
+                local_input[local_h][local_w][c] =
+                    input[(h * kInImSize + w) * kNum + c];
             }
         }
     }
 }
 
-// 读取权重到stream
-void read_weight(DTYPE *weight, hls::stream<DTYPE> &weight_stream)
+// 加载一组权重到本地buffer
+void load_weight_group(
+    DTYPE *weight,
+    DTYPE local_weight[kKernel][kKernel][OC_PARALLEL][IC_PARALLEL],
+    int oc_start, int ic_start)
 {
 #pragma HLS INLINE off
-READ_WEIGHT:
-    for (int p = 0; p < kKernel; ++p)
+
+    for (int kh = 0; kh < kKernel; ++kh)
     {
-        for (int q = 0; q < kKernel; ++q)
+        for (int kw = 0; kw < kKernel; ++kw)
         {
-            for (int i = 0; i < kNum; ++i)
+            for (int oc = 0; oc < OC_PARALLEL; ++oc)
             {
-                for (int j = 0; j < kNum; ++j)
+                for (int ic = 0; ic < IC_PARALLEL; ++ic)
                 {
 #pragma HLS PIPELINE II = 1
-                    weight_stream.write(weight[((p * kKernel + q) * kNum + i) * kNum + j]);
+                    if ((oc_start + oc < kNum) && (ic_start + ic < kNum))
+                    {
+                        local_weight[kh][kw][oc][ic] = weight[((kh * kKernel + kw) * kNum + (ic_start + ic)) * kNum +
+                                                              (oc_start + oc)];
+                    }
                 }
             }
         }
     }
 }
 
-// 计算单元 - 处理8x32的tile
-void compute_unit(
-    hls::stream<DataFlow> &in_stream,
-    hls::stream<DTYPE> &weight_stream,
-    hls::stream<DataFlow> &out_stream,
-    int tile_oc_start)
+// 计算一个tile的卷积
+void compute_tile(
+    DTYPE local_input[TILE_SIZE + kKernel - 1][TILE_SIZE + kKernel - 1][kNum],
+    DTYPE local_weight[kKernel][kKernel][OC_PARALLEL][IC_PARALLEL],
+    DTYPE local_output[TILE_SIZE][TILE_SIZE][OC_PARALLEL],
+    int oc_start, int ic_start)
 {
 #pragma HLS INLINE off
-    const int TILE_IC = 8;
-    const int TILE_OC = 32;
 
-    // 本地缓存
-    DTYPE local_input[kKernel][kKernel][TILE_IC];
-#pragma HLS ARRAY_PARTITION variable = local_input complete dim = 0
-    DTYPE local_weight[kKernel][kKernel][TILE_OC][TILE_IC];
-#pragma HLS ARRAY_PARTITION variable = local_weight complete dim = 0
-    DTYPE local_output[TILE_OC];
-#pragma HLS ARRAY_PARTITION variable = local_output complete dim = 0
-
-    // 主计算循环
-    for (int h = 0; h < kOutImSize; ++h)
+    // 对tile内每个输出位置计算部分结果
+    for (int h = 0; h < TILE_SIZE; ++h)
     {
-        for (int w = 0; w < kOutImSize; ++w)
+        for (int w = 0; w < TILE_SIZE; ++w)
         {
-            // 初始化输出缓存
-            for (int oc = 0; oc < TILE_OC; ++oc)
+            // 累积一组输入通道的结果
+            for (int kh = 0; kh < kKernel; ++kh)
             {
+                for (int kw = 0; kw < kKernel; ++kw)
+                {
+                    for (int oc = 0; oc < OC_PARALLEL; ++oc)
+                    {
+#pragma HLS PIPELINE II = 1
+                        for (int ic = 0; ic < IC_PARALLEL; ++ic)
+                        {
 #pragma HLS UNROLL
-                local_output[oc] = 0;
-            }
-
-            // 计算当前输出位置的卷积
-            for (int ic_base = 0; ic_base < kNum; ic_base += TILE_IC)
-            {
-                // 加载输入数据
-                for (int kh = 0; kh < kKernel; ++kh)
-                {
-                    for (int kw = 0; kw < kKernel; ++kw)
-                    {
-                        for (int ic = 0; ic < TILE_IC; ++ic)
-                        {
-#pragma HLS PIPELINE II = 1
-                            DataFlow temp = in_stream.read();
-                            local_input[kh][kw][ic] = temp.data;
-                        }
-                    }
-                }
-
-                // 加载权重
-                for (int kh = 0; kh < kKernel; ++kh)
-                {
-                    for (int kw = 0; kw < kKernel; ++kw)
-                    {
-                        for (int oc = 0; oc < TILE_OC; ++oc)
-                        {
-                            for (int ic = 0; ic < TILE_IC; ++ic)
+                            if (ic_start == 0 && kh == 0 && kw == 0)
                             {
-#pragma HLS PIPELINE II = 1
-                                local_weight[kh][kw][oc][ic] = weight_stream.read();
+                                local_output[h][w][oc] = 0; // 初始化
                             }
+                            local_output[h][w][oc] +=
+                                local_input[h + kh][w + kw][ic_start + ic] *
+                                local_weight[kh][kw][oc][ic];
                         }
                     }
                 }
-
-                // 计算卷积
-                for (int kh = 0; kh < kKernel; ++kh)
-                {
-                    for (int kw = 0; kw < kKernel; ++kw)
-                    {
-                        for (int oc = 0; oc < TILE_OC; ++oc)
-                        {
-#pragma HLS PIPELINE II = 1
-                            for (int ic = 0; ic < TILE_IC; ++ic)
-                            {
-#pragma HLS UNROLL
-                                local_output[oc] += local_input[kh][kw][ic] *
-                                                    local_weight[kh][kw][oc][ic];
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 输出结果
-            for (int oc = 0; oc < TILE_OC; ++oc)
-            {
-#pragma HLS PIPELINE II = 1
-                DataFlow temp;
-                temp.data = local_output[oc];
-                temp.h = h;
-                temp.w = w;
-                temp.c = tile_oc_start + oc;
-                out_stream.write(temp);
             }
         }
     }
 }
 
-// 写回结果
-void write_output(hls::stream<DataFlow> &out_stream, DTYPE *output)
+// 将计算结果写回全局内存
+void write_tile_result(
+    DTYPE local_output[TILE_SIZE][TILE_SIZE][OC_PARALLEL],
+    DTYPE *output,
+    int tile_h, int tile_w, int oc_start)
 {
 #pragma HLS INLINE off
-    DTYPE local_output[kOutImSize][kOutImSize][kNum] = {0};
-#pragma HLS RESOURCE variable = local_output core = RAM_1P_URAM
 
-    // 收集所有计算单元的输出
-    for (int h = 0; h < kOutImSize; ++h)
+    const int out_h_start = tile_h * TILE_SIZE;
+    const int out_w_start = tile_w * TILE_SIZE;
+
+    for (int h = 0; h < TILE_SIZE; ++h)
     {
-        for (int w = 0; w < kOutImSize; ++w)
+        for (int w = 0; w < TILE_SIZE; ++w)
         {
-            for (int c = 0; c < kNum; ++c)
+            for (int oc = 0; oc < OC_PARALLEL; ++oc)
             {
 #pragma HLS PIPELINE II = 1
-                DataFlow temp = out_stream.read();
-                local_output[temp.h][temp.w][temp.c] = temp.data;
-            }
-        }
-    }
-
-    // 写回全局内存
-    for (int h = 0; h < kOutImSize; ++h)
-    {
-        for (int w = 0; w < kOutImSize; ++w)
-        {
-#pragma HLS PIPELINE II = 1
-            for (int c = 0; c < kNum; ++c)
-            {
-                output[(h * kOutImSize + w) * kNum + c] = local_output[h][w][c];
+                int gh = out_h_start + h;
+                int gw = out_w_start + w;
+                if (gh < kOutImSize && gw < kOutImSize && (oc_start + oc) < kNum)
+                {
+                    output[(gh * kOutImSize + gw) * kNum + (oc_start + oc)] =
+                        local_output[h][w][oc];
+                }
             }
         }
     }
@@ -199,19 +159,54 @@ extern "C"
 #pragma HLS INTERFACE s_axilite port = output bundle = control
 #pragma HLS INTERFACE s_axilite port = return bundle = control
 
-        // 定义数据流
-#pragma HLS DATAFLOW
-        hls::stream<DataFlow> in_stream("in_stream");
-#pragma HLS STREAM variable = in_stream depth = 512
-        hls::stream<DTYPE> weight_stream("weight_stream");
-#pragma HLS STREAM variable = weight_stream depth = 512
-        hls::stream<DataFlow> out_stream("out_stream");
-#pragma HLS STREAM variable = out_stream depth = 512
+        // 本地缓存
+        DTYPE local_input[TILE_SIZE + kKernel - 1][TILE_SIZE + kKernel - 1][kNum];
+#pragma HLS ARRAY_PARTITION variable = local_input cyclic factor = IC_PARALLEL dim = 3
 
-        // 启动数据流处理单元
-        read_input(input, in_stream);
-        read_weight(weight, weight_stream);
-        compute_unit(in_stream, weight_stream, out_stream, 0);
-        write_output(out_stream, output);
+        DTYPE local_weight[kKernel][kKernel][OC_PARALLEL][IC_PARALLEL];
+#pragma HLS ARRAY_PARTITION variable = local_weight complete dim = 3
+#pragma HLS ARRAY_PARTITION variable = local_weight complete dim = 4
+
+        DTYPE local_output[TILE_SIZE][TILE_SIZE][OC_PARALLEL];
+#pragma HLS ARRAY_PARTITION variable = local_output complete dim = 3
+
+        // 按tile遍历整个特征图
+        for (int th = 0; th < (kOutImSize + TILE_SIZE - 1) / TILE_SIZE; ++th)
+        {
+            for (int tw = 0; tw < (kOutImSize + TILE_SIZE - 1) / TILE_SIZE; ++tw)
+            {
+                // 加载当前tile的输入数据
+                load_input_tile(input, local_input, th, tw);
+
+                // 对输出通道分组处理
+                for (int oc = 0; oc < kNum; oc += OC_PARALLEL)
+                {
+                    // 初始化输出缓存
+                    for (int h = 0; h < TILE_SIZE; ++h)
+                    {
+                        for (int w = 0; w < TILE_SIZE; ++w)
+                        {
+                            for (int i = 0; i < OC_PARALLEL; ++i)
+                            {
+#pragma HLS PIPELINE II = 1
+                                local_output[h][w][i] = 0;
+                            }
+                        }
+                    }
+
+                    // 对输入通道分组累积
+                    for (int ic = 0; ic < kNum; ic += IC_PARALLEL)
+                    {
+                        // 加载对应的权重组
+                        load_weight_group(weight, local_weight, oc, ic);
+                        // 计算部分结果
+                        compute_tile(local_input, local_weight, local_output, oc, ic);
+                    }
+
+                    // 写回当前输出通道组的结果
+                    write_tile_result(local_output, output, th, tw, oc);
+                }
+            }
+        }
     }
 }
